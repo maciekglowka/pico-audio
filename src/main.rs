@@ -1,12 +1,15 @@
 #![no_std]
 #![no_main]
 
-use embedded_hal::{delay::DelayNs, digital::OutputPin};
+use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use critical_section::Mutex;
+use embedded_hal::delay::DelayNs;
 use panic_halt as _;
+use rp235x_hal::rom_data::sys_info_api::boot_random;
 use rp235x_hal::{self as hal, Clock};
 
 use hal::fugit::RateExtU32;
-use hal::uart::{DataBits, StopBits, UartConfig, ValidatedPinRx, ValidatedPinTx};
+use hal::uart::{DataBits, StopBits, UartConfig};
 
 // TEMP
 use usb_device::{class_prelude::*, prelude::*};
@@ -18,15 +21,24 @@ pub static IMAGE_DEF: hal::block::ImageDef = hal::block::ImageDef::secure_exe();
 
 const XTAL_FREQ_HZ: u32 = 12_000_000;
 
-const VOLUME: u16 = 20;
+const VOLUME: u16 = 10;
 
-const CMD_NEXT: u8 = 0x01;
-const CMD_PREV: u8 = 0x02;
+const CMD_PLAY_NEXT: u8 = 0x01;
+const CMD_PLAY_PREV: u8 = 0x02;
 const CMD_SET_VOL: u8 = 0x06;
+const CMD_PLAY_TRACK: u8 = 0x03;
 const CMD_PLAY: u8 = 0x0d;
+const CMD_PAUSE: u8 = 0x0e;
 const CMD_STANDBY: u8 = 0x0a;
+const CMD_QUERY_FILE_COUNT: u8 = 0x48;
 
-const CMD_QUERY_FILE_COUNT: u8 = 0x49;
+const RESP_PLAY_FINISHED: u8 = 0x3d;
+
+static IS_PLAYNG: AtomicBool = AtomicBool::new(false);
+static TRACK: AtomicU16 = AtomicU16::new(1);
+static TRACK_COUNT: AtomicU16 = AtomicU16::new(1);
+
+static READ_BUF: Mutex<[u8; 256]> = Mutex::new([0; 256]);
 
 #[hal::entry]
 fn main() -> ! {
@@ -75,8 +87,8 @@ fn main() -> ! {
         .device_class(2)
         .build();
 
-    let uart_tx = pins.gpio0.into_function();
-    let uart_rx = pins.gpio1.into_function();
+    let uart_tx = pins.gpio16.into_function();
+    let uart_rx = pins.gpio17.into_function();
     let uart0 = hal::uart::UartPeripheral::new(pac.UART0, (uart_tx, uart_rx), &mut pac.RESETS)
         .enable(
             UartConfig::new(9600.Hz(), DataBits::Eight, None, StopBits::One),
@@ -84,55 +96,50 @@ fn main() -> ! {
         )
         .unwrap();
 
-    let mut led_pin = pins.gpio25.into_push_pull_output();
-
-    uart0.write_full_blocking(&cmd_packet(CMD_SET_VOL, VOLUME));
-    timer.delay_ms(100);
-    uart0.write_full_blocking(&cmd_packet(CMD_PLAY, 0));
-    timer.delay_ms(100);
-
-    let mut acc = 0;
-
-    uart0.write_full_blocking(&cmd_packet(CMD_QUERY_FILE_COUNT, 0));
-    timer.delay_ms(20);
+    // Wait for mp3 init.
+    timer.delay_ms(1500);
 
     let mut read_buf = [0; 256];
-    let mut len = None;
+
+    uart0.write_full_blocking(&cmd_packet(CMD_QUERY_FILE_COUNT, 0));
+    timer.delay_ms(50);
+
     if let Ok(l) = uart0.read_raw(&mut read_buf) {
-        len = Some(l);
+        let (_cmd, value) = parse_response(&read_buf[..l]);
+        TRACK_COUNT.store(value, Ordering::Relaxed);
     }
 
+    if let Ok(Some(r)) = boot_random() {
+        let initial = (r.0 as u16) % TRACK_COUNT.load(Ordering::Relaxed);
+        TRACK.store(initial, Ordering::Relaxed);
+    }
+
+    timer.delay_ms(100);
+    uart0.write_full_blocking(&cmd_packet(CMD_SET_VOL, VOLUME));
+
+    // Set interrupts.
+
     loop {
-        // led_pin.set_high().unwrap();
-        // timer.delay_ms(500);
-        // led_pin.set_low().unwrap();
-        // timer.delay_ms(500);
-        // acc += 1000;
-        // if acc > 5000 {
-        //     acc = 0;
-
-        //     // uart0.write_full_blocking(&cmd_packet(CMD_NEXT, 0));
-        // }
-
-        if let Some(len) = len {
-            let _ = serial.write(&read_buf[..len]);
-            let _ = serial.write(b"\r\n");
-        } else {
-            let _ = serial.write(b"AAA");
-            let _ = serial.write(b"\r\n");
-            // uart0.write_full_blocking(&cmd_packet(CMD_QUERY_FILE_COUNT, 0));
-            // timer.delay_ms(50);
-
-            // if let Ok(l) = uart0.read_raw(&mut read_buf) {
-            //     len = Some(l);
-            // }
-        }
-
-        if usb_dev.poll(&mut [&mut serial]) {
-            let mut buf = [0u8; 64];
-            match serial.read(&mut buf) {
-                _ => (),
+        if IS_PLAYNG.load(Ordering::Relaxed) {
+            if let Ok(l) = uart0.read_raw(&mut read_buf) {
+                let (cmd, _value) = parse_response(&read_buf[..l]);
+                if cmd == RESP_PLAY_FINISHED {
+                    IS_PLAYNG.store(false, Ordering::Relaxed);
+                    let _ = serial.write(b"FINISHED\r\n");
+                }
             }
+
+            if usb_dev.poll(&mut [&mut serial]) {
+                let mut buf = [0u8; 64];
+                match serial.read(&mut buf) {
+                    _ => (),
+                }
+            }
+
+            // TODO add timer delay when usb debug is removed.
+        } else {
+            // Wait for button press to start playing.
+            rp235x_hal::arch::wfi();
         }
     }
 }
@@ -147,6 +154,21 @@ fn cmd_packet(cmd: u8, param: u16) -> [u8; 10] {
     let ph = (param >> 8) as u8;
     let pl = param as u8;
     [0x7e, ver, len, cmd, 0, ph, pl, ch, cl, 0xef]
+}
+
+/// Returns (op_code, value)
+fn parse_response(packet: &[u8]) -> (u8, u16) {
+    if packet.len() < 10 {
+        return 0;
+    }
+
+    let cmd = packet[3];
+
+    let msb = packet[5] as u16;
+    let lsb = packet[6] as u16;
+
+    // TODO checksum?
+    (cmd, msb << 8 | lsb)
 }
 
 #[unsafe(link_section = ".bi_entries")]
