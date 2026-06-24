@@ -7,6 +7,7 @@ use critical_section::Mutex;
 use embedded_hal::delay::DelayNs;
 use panic_halt as _;
 use rp235x_hal::rom_data::sys_info_api::boot_random;
+use rp235x_hal::uart::{Enabled, UartDevice, UartPeripheral, ValidUartPinout};
 use rp235x_hal::{self as hal, gpio, Clock};
 
 use hal::fugit::RateExtU32;
@@ -27,6 +28,9 @@ pub static IMAGE_DEF: hal::block::ImageDef = hal::block::ImageDef::secure_exe();
 const XTAL_FREQ_HZ: u32 = 12_000_000;
 
 const VOLUME: u16 = 15;
+
+const PACKET_START: u8 = 0x7e;
+const PACKET_END: u8 = 0xef;
 
 const CMD_SET_VOL: u8 = 0x06;
 const CMD_PLAY_TRACK: u8 = 0x03;
@@ -125,13 +129,13 @@ fn main() -> ! {
     // Set buttons.
 
     let prev_pin = pins.gpio5.reconfigure();
-    prev_pin.set_interrupt_enabled(gpio::Interrupt::EdgeHigh, true);
+    prev_pin.set_interrupt_enabled(gpio::Interrupt::EdgeLow, true);
 
     let play_pin = pins.gpio9.reconfigure();
-    play_pin.set_interrupt_enabled(gpio::Interrupt::EdgeHigh, true);
+    play_pin.set_interrupt_enabled(gpio::Interrupt::EdgeLow, true);
 
     let next_pin = pins.gpio13.reconfigure();
-    next_pin.set_interrupt_enabled(gpio::Interrupt::EdgeHigh, true);
+    next_pin.set_interrupt_enabled(gpio::Interrupt::EdgeLow, true);
 
     #[cfg(feature = "led")]
     let led_pin = pins.gpio25.reconfigure();
@@ -149,20 +153,29 @@ fn main() -> ! {
     // Wait for mp3 init.
     timer.delay_ms(1500);
 
+    let mut buf_front = 0;
     let mut read_buf = [0; 256];
     let _ = uart0.read_raw(&mut read_buf);
 
     uart0.write_full_blocking(&cmd_packet(CMD_QUERY_FILE_COUNT, 0));
-    timer.delay_ms(50);
+    timer.delay_ms(20);
 
-    if let Ok(l) = uart0.read_raw(&mut read_buf) {
-        let (_cmd, value) = parse_response(&read_buf[..l]);
-        TRACK_COUNT.store(value, Ordering::Relaxed);
+    loop {
+        if let Some(l) = try_read(&uart0, &mut read_buf, &mut buf_front) {
+            let (cmd, value) = parse_response(&read_buf[..l]);
+            if cmd != CMD_QUERY_FILE_COUNT {
+                continue;
+            }
+
+            TRACK_COUNT.store(value, Ordering::Relaxed);
+            break;
+        }
     }
 
     if let Ok(Some(r)) = boot_random() {
         let initial = (r.0 as u16) % TRACK_COUNT.load(Ordering::Relaxed);
-        TRACK.store(initial, Ordering::Relaxed);
+        // 1-indexed.
+        TRACK.store(1 + initial, Ordering::Relaxed);
     }
 
     timer.delay_ms(100);
@@ -184,11 +197,14 @@ fn main() -> ! {
                 hal::arch::wfi();
             }
             STATE_ABOUT_TO_PAUSE => {
-                #[cfg(feature = "usb")]
-                let _ = serial.write(b"PAUSE\r\n");
+                #[cfg(not(feature = "usb"))]
+                timer.delay_ms(20);
 
                 PLAY_STATE.store(STATE_PAUSE, Ordering::Relaxed);
                 uart0.write_full_blocking(&cmd_packet(CMD_PAUSE, 0));
+
+                #[cfg(feature = "usb")]
+                let _ = serial.write(b"PAUSE\r\n");
 
                 // #[cfg(not(feature = "usb"))]
                 // timer.delay_ms(100);
@@ -196,6 +212,10 @@ fn main() -> ! {
                 // uart0.write_full_blocking(&cmd_packet(CMD_STANDBY, 0));
             }
             STATE_ABOUT_TO_PLAY => {
+                // Debounce
+                #[cfg(not(feature = "usb"))]
+                timer.delay_ms(20);
+
                 PLAY_STATE.store(STATE_PLAYING, Ordering::Relaxed);
 
                 // #[cfg(not(feature = "usb"))]
@@ -212,7 +232,7 @@ fn main() -> ! {
                 let _ = serial.write(b"PLAY\r\n");
             }
             STATE_PLAYING => {
-                if let Ok(l) = uart0.read_raw(&mut read_buf) {
+                if let Some(l) = try_read(&uart0, &mut read_buf, &mut buf_front) {
                     let (cmd, _value) = parse_response(&read_buf[..l]);
                     if cmd == RESP_PLAY_FINISHED {
                         PLAY_STATE.store(STATE_ABOUT_TO_PAUSE, Ordering::Relaxed);
@@ -231,12 +251,11 @@ fn main() -> ! {
                         let _ = serial.write(b"FINISHED\r\n");
                     }
                 }
+                #[cfg(not(feature = "usb"))]
+                timer.delay_ms(10);
             }
             _ => (),
         }
-
-        #[cfg(not(feature = "usb"))]
-        timer.delay_ms(10);
 
         #[cfg(feature = "usb")]
         if usb_dev.poll(&mut [&mut serial]) {
@@ -260,6 +279,34 @@ fn cmd_packet(cmd: u8, param: u16) -> [u8; 10] {
     [0x7e, ver, len, cmd, 0, ph, pl, ch, cl, 0xef]
 }
 
+/// Always assumes 10 byte packet.
+///
+/// Not fail-safe. Does not check packet start / end.
+/// Assumes happy path ;)
+fn try_read<D, P>(
+    uart: &UartPeripheral<Enabled, D, P>,
+    buf: &mut [u8],
+    front: &mut usize,
+) -> Option<usize>
+where
+    D: UartDevice,
+    P: ValidUartPinout<D>,
+{
+    let mut scratch = [0; 64];
+    let len = uart.read_raw(&mut scratch).ok()?;
+
+    buf[*front..].copy_from_slice(&scratch[..len]);
+    *front += len;
+
+    if *front < 10 {
+        return None;
+    }
+
+    *front = 0;
+
+    Some(10)
+}
+
 /// Returns (op_code, value)
 fn parse_response(packet: &[u8]) -> (u8, u16) {
     if packet.len() < 10 {
@@ -276,6 +323,11 @@ fn parse_response(packet: &[u8]) -> (u8, u16) {
 }
 
 fn change_track(track: u16) {
+    // Do nothing when in `ABOUT` states for a simple debouncing.
+    match PLAY_STATE.load(Ordering::Relaxed) {
+        STATE_ABOUT_TO_PAUSE | STATE_ABOUT_TO_PLAY => return,
+        _ => (),
+    };
     TRACK.store(track, Ordering::Relaxed);
     PLAY_STATE.store(STATE_ABOUT_TO_PLAY, Ordering::Relaxed);
 }
@@ -286,7 +338,7 @@ fn change_track(track: u16) {
 fn IO_IRQ_BANK0() {
     critical_section::with(|cs| {
         if let Some(state) = BUTTON_STATE.borrow_ref_mut(cs).as_mut() {
-            if state.prev_pin.interrupt_status(gpio::Interrupt::EdgeHigh) {
+            if state.prev_pin.interrupt_status(gpio::Interrupt::EdgeLow) {
                 // TODO atomic operations needed?
                 let track = TRACK.load(Ordering::Relaxed);
                 let track_count = TRACK_COUNT.load(Ordering::Relaxed);
@@ -299,24 +351,21 @@ fn IO_IRQ_BANK0() {
                 #[cfg(feature = "led")]
                 state.led_pin.toggle();
 
-                state.prev_pin.clear_interrupt(gpio::Interrupt::EdgeHigh);
+                state.prev_pin.clear_interrupt(gpio::Interrupt::EdgeLow);
             }
-            if state.play_pin.interrupt_status(gpio::Interrupt::EdgeHigh) {
+            if state.play_pin.interrupt_status(gpio::Interrupt::EdgeLow) {
+                // Do nothing when in `ABOUT` states for a simple debouncing.
                 match PLAY_STATE.load(Ordering::Relaxed) {
-                    STATE_PAUSE | STATE_ABOUT_TO_PAUSE => {
-                        PLAY_STATE.store(STATE_ABOUT_TO_PLAY, Ordering::Relaxed)
-                    }
-                    STATE_PLAYING | STATE_ABOUT_TO_PLAY => {
-                        PLAY_STATE.store(STATE_ABOUT_TO_PAUSE, Ordering::Relaxed)
-                    }
+                    STATE_PAUSE => PLAY_STATE.store(STATE_ABOUT_TO_PLAY, Ordering::Relaxed),
+                    STATE_PLAYING => PLAY_STATE.store(STATE_ABOUT_TO_PAUSE, Ordering::Relaxed),
                     _ => (),
                 }
                 #[cfg(feature = "led")]
                 state.led_pin.toggle();
 
-                state.play_pin.clear_interrupt(gpio::Interrupt::EdgeHigh);
+                state.play_pin.clear_interrupt(gpio::Interrupt::EdgeLow);
             }
-            if state.next_pin.interrupt_status(gpio::Interrupt::EdgeHigh) {
+            if state.next_pin.interrupt_status(gpio::Interrupt::EdgeLow) {
                 let track = TRACK.load(Ordering::Relaxed);
                 let track_count = TRACK_COUNT.load(Ordering::Relaxed);
                 if track >= track_count {
@@ -328,7 +377,7 @@ fn IO_IRQ_BANK0() {
                 #[cfg(feature = "led")]
                 state.led_pin.toggle();
 
-                state.next_pin.clear_interrupt(gpio::Interrupt::EdgeHigh);
+                state.next_pin.clear_interrupt(gpio::Interrupt::EdgeLow);
             }
         }
     })
