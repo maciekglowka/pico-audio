@@ -198,7 +198,7 @@ fn main() -> ! {
             }
             STATE_ABOUT_TO_PAUSE => {
                 #[cfg(not(feature = "usb"))]
-                timer.delay_ms(20);
+                timer.delay_ms(50);
 
                 PLAY_STATE.store(STATE_PAUSE, Ordering::Relaxed);
                 uart0.write_full_blocking(&cmd_packet(CMD_PAUSE, 0));
@@ -214,7 +214,7 @@ fn main() -> ! {
             STATE_ABOUT_TO_PLAY => {
                 // Debounce
                 #[cfg(not(feature = "usb"))]
-                timer.delay_ms(20);
+                timer.delay_ms(50);
 
                 PLAY_STATE.store(STATE_PLAYING, Ordering::Relaxed);
 
