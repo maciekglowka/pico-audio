@@ -5,7 +5,6 @@ use core::cell::RefCell;
 use core::sync::atomic::{AtomicU16, Ordering};
 use critical_section::Mutex;
 use embedded_hal::delay::DelayNs;
-use embedded_hal::digital::StatefulOutputPin;
 use panic_halt as _;
 use rp235x_hal::rom_data::sys_info_api::boot_random;
 use rp235x_hal::{self as hal, gpio, Clock};
@@ -13,8 +12,12 @@ use rp235x_hal::{self as hal, gpio, Clock};
 use hal::fugit::RateExtU32;
 use hal::uart::{DataBits, StopBits, UartConfig};
 
-// TEMP
+#[cfg(feature = "led")]
+use embedded_hal::digital::StatefulOutputPin;
+
+#[cfg(feature = "usb")]
 use usb_device::{class_prelude::*, prelude::*};
+#[cfg(feature = "usb")]
 use usbd_serial::SerialPort;
 
 #[unsafe(link_section = ".start_block")]
@@ -23,12 +26,13 @@ pub static IMAGE_DEF: hal::block::ImageDef = hal::block::ImageDef::secure_exe();
 
 const XTAL_FREQ_HZ: u32 = 12_000_000;
 
-const VOLUME: u16 = 15;
+const VOLUME: u16 = 20;
 
 const CMD_SET_VOL: u8 = 0x06;
 const CMD_PLAY_TRACK: u8 = 0x03;
 const CMD_PAUSE: u8 = 0x0e;
 const CMD_STANDBY: u8 = 0x0a;
+const CMD_WAKEUP: u8 = 0x0b;
 const CMD_QUERY_FILE_COUNT: u8 = 0x48;
 
 const RESP_PLAY_FINISHED: u8 = 0x3d;
@@ -42,18 +46,18 @@ static PLAY_STATE: AtomicU16 = AtomicU16::new(STATE_PAUSE);
 static TRACK: AtomicU16 = AtomicU16::new(1);
 static TRACK_COUNT: AtomicU16 = AtomicU16::new(1);
 
-// static READ_BUF: Mutex<[u8; 256]> = Mutex::new([0; 256]);
-
 type ButtonPrevPin = gpio::Pin<gpio::bank0::Gpio5, gpio::FunctionSioInput, gpio::PullUp>;
 type ButtonPlayPin = gpio::Pin<gpio::bank0::Gpio9, gpio::FunctionSioInput, gpio::PullUp>;
 type ButtonNextPin = gpio::Pin<gpio::bank0::Gpio13, gpio::FunctionSioInput, gpio::PullUp>;
 
+#[cfg(feature = "led")]
 type LedPin = gpio::Pin<gpio::bank0::Gpio25, gpio::FunctionSioOutput, gpio::PullNone>;
 
 struct ButtonPins {
     prev_pin: ButtonPrevPin,
     play_pin: ButtonPlayPin,
     next_pin: ButtonNextPin,
+    #[cfg(feature = "led")]
     led_pin: LedPin,
 }
 
@@ -86,7 +90,7 @@ fn main() -> ! {
         &mut pac.RESETS,
     );
 
-    // TEMP USB
+    #[cfg(feature = "usb")]
     let usb_bus = UsbBusAllocator::new(hal::usb::UsbBus::new(
         pac.USB,
         pac.USB_DPRAM,
@@ -94,7 +98,9 @@ fn main() -> ! {
         true,
         &mut pac.RESETS,
     ));
+    #[cfg(feature = "usb")]
     let mut serial = SerialPort::new(&usb_bus);
+    #[cfg(feature = "usb")]
     let mut usb_dev = UsbDeviceBuilder::new(&usb_bus, UsbVidPid(0x16c0, 0x27dd))
         .strings(&[StringDescriptors::default()
             .manufacturer("maciek")
@@ -127,6 +133,7 @@ fn main() -> ! {
     let next_pin = pins.gpio13.reconfigure();
     next_pin.set_interrupt_enabled(gpio::Interrupt::EdgeHigh, true);
 
+    #[cfg(feature = "led")]
     let led_pin = pins.gpio25.reconfigure();
 
     critical_section::with(|cs| {
@@ -134,6 +141,7 @@ fn main() -> ! {
             prev_pin,
             play_pin,
             next_pin,
+            #[cfg(feature = "led")]
             led_pin,
         }));
     });
@@ -172,21 +180,35 @@ fn main() -> ! {
         match PLAY_STATE.load(Ordering::Relaxed) {
             STATE_PAUSE => {
                 // Wait for button press to start playing.
-                // hal::arch::wfi();
+                #[cfg(not(feature = "usb"))]
+                hal::arch::wfi();
             }
             STATE_ABOUT_TO_PAUSE => {
+                #[cfg(feature = "usb")]
                 let _ = serial.write(b"PAUSE\r\n");
+
                 PLAY_STATE.store(STATE_PAUSE, Ordering::Relaxed);
                 uart0.write_full_blocking(&cmd_packet(CMD_PAUSE, 0));
+
+                // #[cfg(not(feature = "usb"))]
                 // timer.delay_ms(100);
+                // #[cfg(not(feature = "usb"))]
                 // uart0.write_full_blocking(&cmd_packet(CMD_STANDBY, 0));
             }
             STATE_ABOUT_TO_PLAY => {
                 PLAY_STATE.store(STATE_PLAYING, Ordering::Relaxed);
+
+                // #[cfg(not(feature = "usb"))]
+                // uart0.write_full_blocking(&cmd_packet(CMD_WAKEUP, 0));
+                // #[cfg(not(feature = "usb"))]
+                // timer.delay_ms(100);
+
                 uart0.write_full_blocking(&cmd_packet(
                     CMD_PLAY_TRACK,
                     TRACK.load(Ordering::Relaxed),
                 ));
+
+                #[cfg(feature = "usb")]
                 let _ = serial.write(b"PLAY\r\n");
             }
             STATE_PLAYING => {
@@ -194,14 +216,29 @@ fn main() -> ! {
                     let (cmd, _value) = parse_response(&read_buf[..l]);
                     if cmd == RESP_PLAY_FINISHED {
                         PLAY_STATE.store(STATE_ABOUT_TO_PAUSE, Ordering::Relaxed);
+
+                        // Advance track for next play.
+                        let track = TRACK.load(Ordering::Relaxed);
+                        let track_count = TRACK_COUNT.load(Ordering::Relaxed);
+                        if track >= track_count {
+                            // 1-indexed
+                            TRACK.store(1, Ordering::Relaxed);
+                        } else {
+                            TRACK.store(track + 1, Ordering::Relaxed);
+                        }
+
+                        #[cfg(feature = "usb")]
                         let _ = serial.write(b"FINISHED\r\n");
                     }
                 }
-
-                // TODO add timer delay when usb debug is removed.
             }
             _ => (),
         }
+
+        #[cfg(not(feature = "usb"))]
+        timer.delay_ms(10);
+
+        #[cfg(feature = "usb")]
         if usb_dev.poll(&mut [&mut serial]) {
             let mut buf = [0u8; 64];
             match serial.read(&mut buf) {
@@ -259,7 +296,9 @@ fn IO_IRQ_BANK0() {
                 } else {
                     change_track(track - 1);
                 }
+                #[cfg(feature = "led")]
                 state.led_pin.toggle();
+
                 state.prev_pin.clear_interrupt(gpio::Interrupt::EdgeHigh);
             }
             if state.play_pin.interrupt_status(gpio::Interrupt::EdgeHigh) {
@@ -272,7 +311,9 @@ fn IO_IRQ_BANK0() {
                     }
                     _ => (),
                 }
+                #[cfg(feature = "led")]
                 state.led_pin.toggle();
+
                 state.play_pin.clear_interrupt(gpio::Interrupt::EdgeHigh);
             }
             if state.next_pin.interrupt_status(gpio::Interrupt::EdgeHigh) {
@@ -284,7 +325,9 @@ fn IO_IRQ_BANK0() {
                 } else {
                     change_track(track + 1);
                 }
+                #[cfg(feature = "led")]
                 state.led_pin.toggle();
+
                 state.next_pin.clear_interrupt(gpio::Interrupt::EdgeHigh);
             }
         }
