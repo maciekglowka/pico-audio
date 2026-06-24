@@ -26,7 +26,7 @@ pub static IMAGE_DEF: hal::block::ImageDef = hal::block::ImageDef::secure_exe();
 
 const XTAL_FREQ_HZ: u32 = 12_000_000;
 
-const VOLUME: u16 = 20;
+const VOLUME: u16 = 15;
 
 const CMD_SET_VOL: u8 = 0x06;
 const CMD_PLAY_TRACK: u8 = 0x03;
