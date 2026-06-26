@@ -5,7 +5,9 @@ use core::cell::RefCell;
 use core::sync::atomic::{AtomicU16, Ordering};
 use critical_section::Mutex;
 use embedded_hal::delay::DelayNs;
+use embedded_hal_nb::serial::Read;
 use panic_halt as _;
+
 use rp235x_hal::rom_data::sys_info_api::boot_random;
 use rp235x_hal::uart::{Enabled, UartDevice, UartPeripheral, ValidUartPinout};
 use rp235x_hal::{self as hal, gpio, Clock};
@@ -27,6 +29,7 @@ pub static IMAGE_DEF: hal::block::ImageDef = hal::block::ImageDef::secure_exe();
 
 const XTAL_FREQ_HZ: u32 = 12_000_000;
 
+const DEBOUNCE_DELAY: u32 = 500;
 const VOLUME: u16 = 15;
 
 const PACKET_START: u8 = 0x7e;
@@ -119,7 +122,7 @@ fn main() -> ! {
     // Set uart.
     let uart_tx = pins.gpio16.into_function();
     let uart_rx = pins.gpio17.into_function();
-    let uart0 = hal::uart::UartPeripheral::new(pac.UART0, (uart_tx, uart_rx), &mut pac.RESETS)
+    let mut uart0 = hal::uart::UartPeripheral::new(pac.UART0, (uart_tx, uart_rx), &mut pac.RESETS)
         .enable(
             UartConfig::new(9600.Hz(), DataBits::Eight, None, StopBits::One),
             clocks.peripheral_clock.freq(),
@@ -153,7 +156,7 @@ fn main() -> ! {
     // Wait for mp3 init.
     timer.delay_ms(1500);
 
-    let mut buf_front = 0;
+    let mut read_front = 0;
     let mut read_buf = [0; 256];
     let _ = uart0.read_raw(&mut read_buf);
 
@@ -161,15 +164,19 @@ fn main() -> ! {
     timer.delay_ms(20);
 
     loop {
-        if let Some(l) = try_read(&uart0, &mut read_buf, &mut buf_front) {
+        if let Some(l) = try_read(&mut uart0, &mut read_buf, &mut read_front) {
             let (cmd, value) = parse_response(&read_buf[..l]);
             if cmd != CMD_QUERY_FILE_COUNT {
                 continue;
             }
-
             TRACK_COUNT.store(value, Ordering::Relaxed);
             break;
         }
+    }
+
+    if let Ok(l) = uart0.read_raw(&mut read_buf) {
+        let (_cmd, value) = parse_response(&read_buf[..l]);
+        TRACK_COUNT.store(value, Ordering::Relaxed);
     }
 
     if let Ok(Some(r)) = boot_random() {
@@ -197,11 +204,11 @@ fn main() -> ! {
                 hal::arch::wfi();
             }
             STATE_ABOUT_TO_PAUSE => {
-                #[cfg(not(feature = "usb"))]
-                timer.delay_ms(50);
-
-                PLAY_STATE.store(STATE_PAUSE, Ordering::Relaxed);
                 uart0.write_full_blocking(&cmd_packet(CMD_PAUSE, 0));
+
+                #[cfg(not(feature = "usb"))]
+                timer.delay_ms(DEBOUNCE_DELAY);
+                PLAY_STATE.store(STATE_PAUSE, Ordering::Relaxed);
 
                 #[cfg(feature = "usb")]
                 let _ = serial.write(b"PAUSE\r\n");
@@ -212,12 +219,6 @@ fn main() -> ! {
                 // uart0.write_full_blocking(&cmd_packet(CMD_STANDBY, 0));
             }
             STATE_ABOUT_TO_PLAY => {
-                // Debounce
-                #[cfg(not(feature = "usb"))]
-                timer.delay_ms(50);
-
-                PLAY_STATE.store(STATE_PLAYING, Ordering::Relaxed);
-
                 // #[cfg(not(feature = "usb"))]
                 // uart0.write_full_blocking(&cmd_packet(CMD_WAKEUP, 0));
                 // #[cfg(not(feature = "usb"))]
@@ -228,11 +229,16 @@ fn main() -> ! {
                     TRACK.load(Ordering::Relaxed),
                 ));
 
+                // Debounce
+                #[cfg(not(feature = "usb"))]
+                timer.delay_ms(DEBOUNCE_DELAY);
+                PLAY_STATE.store(STATE_PLAYING, Ordering::Relaxed);
+
                 #[cfg(feature = "usb")]
                 let _ = serial.write(b"PLAY\r\n");
             }
             STATE_PLAYING => {
-                if let Some(l) = try_read(&uart0, &mut read_buf, &mut buf_front) {
+                if let Some(l) = try_read(&mut uart0, &mut read_buf, &mut read_front) {
                     let (cmd, _value) = parse_response(&read_buf[..l]);
                     if cmd == RESP_PLAY_FINISHED {
                         PLAY_STATE.store(STATE_ABOUT_TO_PAUSE, Ordering::Relaxed);
@@ -260,9 +266,7 @@ fn main() -> ! {
         #[cfg(feature = "usb")]
         if usb_dev.poll(&mut [&mut serial]) {
             let mut buf = [0u8; 64];
-            match serial.read(&mut buf) {
-                _ => (),
-            }
+            let _ = serial.read(&mut buf);
         }
     }
 }
@@ -279,12 +283,8 @@ fn cmd_packet(cmd: u8, param: u16) -> [u8; 10] {
     [0x7e, ver, len, cmd, 0, ph, pl, ch, cl, 0xef]
 }
 
-/// Always assumes 10 byte packet.
-///
-/// Not fail-safe. Does not check packet start / end.
-/// Assumes happy path ;)
 fn try_read<D, P>(
-    uart: &UartPeripheral<Enabled, D, P>,
+    uart: &mut UartPeripheral<Enabled, D, P>,
     buf: &mut [u8],
     front: &mut usize,
 ) -> Option<usize>
@@ -292,19 +292,37 @@ where
     D: UartDevice,
     P: ValidUartPinout<D>,
 {
-    let mut scratch = [0; 64];
-    let len = uart.read_raw(&mut scratch).ok()?;
+    // Assume `WouldBlock` error ;)
+    let byte = uart.read().ok()?;
+    let reads_packet = *front > 0;
 
-    buf[*front..].copy_from_slice(&scratch[..len]);
-    *front += len;
-
-    if *front < 10 {
+    // Try to start a new packet.
+    if byte == PACKET_START && !reads_packet {
+        *front = 1;
+        buf[0] = byte;
         return None;
     }
 
-    *front = 0;
+    if !reads_packet {
+        return None;
+    }
 
-    Some(10)
+    buf[*front] = byte;
+    *front += 1;
+
+    let packet_size = if *front >= 2 {
+        buf[2] as usize
+    } else {
+        return None;
+    };
+
+    if byte == PACKET_END && *front >= packet_size + 4 {
+        let output = *front;
+        *front = 0;
+        return Some(output);
+    }
+
+    None
 }
 
 /// Returns (op_code, value)
@@ -322,62 +340,67 @@ fn parse_response(packet: &[u8]) -> (u8, u16) {
     (cmd, msb << 8 | lsb)
 }
 
-fn change_track(track: u16) {
-    // Do nothing when in `ABOUT` states for a simple debouncing.
-    match PLAY_STATE.load(Ordering::Relaxed) {
-        STATE_ABOUT_TO_PAUSE | STATE_ABOUT_TO_PLAY => return,
-        _ => (),
-    };
-    TRACK.store(track, Ordering::Relaxed);
-    PLAY_STATE.store(STATE_ABOUT_TO_PLAY, Ordering::Relaxed);
-}
-
 /// Interrupt handler.
 #[allow(non_snake_case)]
 #[unsafe(no_mangle)]
 fn IO_IRQ_BANK0() {
     critical_section::with(|cs| {
+        let play_state = PLAY_STATE.load(Ordering::Relaxed);
+        let debounce = play_state == STATE_ABOUT_TO_PAUSE || play_state == STATE_ABOUT_TO_PLAY;
+
         if let Some(state) = BUTTON_STATE.borrow_ref_mut(cs).as_mut() {
             if state.prev_pin.interrupt_status(gpio::Interrupt::EdgeLow) {
-                // TODO atomic operations needed?
-                let track = TRACK.load(Ordering::Relaxed);
-                let track_count = TRACK_COUNT.load(Ordering::Relaxed);
-                if track <= 1 {
-                    // 1-indexed
-                    change_track(track_count);
-                } else {
-                    change_track(track - 1);
+                if !debounce {
+                    let track = TRACK.load(Ordering::Relaxed);
+                    let track_count = TRACK_COUNT.load(Ordering::Relaxed);
+
+                    let prev = if track <= 1 {
+                        // 1-indexed
+                        track_count
+                    } else {
+                        track - 1
+                    };
+
+                    TRACK.store(prev, Ordering::Relaxed);
+                    PLAY_STATE.store(STATE_ABOUT_TO_PLAY, Ordering::Relaxed);
+
+                    #[cfg(feature = "led")]
+                    state.led_pin.toggle();
                 }
-                #[cfg(feature = "led")]
-                state.led_pin.toggle();
 
                 state.prev_pin.clear_interrupt(gpio::Interrupt::EdgeLow);
             }
-            if state.play_pin.interrupt_status(gpio::Interrupt::EdgeLow) {
-                // Do nothing when in `ABOUT` states for a simple debouncing.
-                match PLAY_STATE.load(Ordering::Relaxed) {
-                    STATE_PAUSE => PLAY_STATE.store(STATE_ABOUT_TO_PLAY, Ordering::Relaxed),
-                    STATE_PLAYING => PLAY_STATE.store(STATE_ABOUT_TO_PAUSE, Ordering::Relaxed),
-                    _ => (),
-                }
-                #[cfg(feature = "led")]
-                state.led_pin.toggle();
-
-                state.play_pin.clear_interrupt(gpio::Interrupt::EdgeLow);
-            }
             if state.next_pin.interrupt_status(gpio::Interrupt::EdgeLow) {
-                let track = TRACK.load(Ordering::Relaxed);
-                let track_count = TRACK_COUNT.load(Ordering::Relaxed);
-                if track >= track_count {
-                    // 1-indexed
-                    change_track(1);
-                } else {
-                    change_track(track + 1);
+                if !debounce {
+                    let track = TRACK.load(Ordering::Relaxed);
+                    let track_count = TRACK_COUNT.load(Ordering::Relaxed);
+
+                    let next = if track >= track_count {
+                        // 1-indexed
+                        1
+                    } else {
+                        track + 1
+                    };
+                    TRACK.store(next, Ordering::Relaxed);
+                    PLAY_STATE.store(STATE_ABOUT_TO_PLAY, Ordering::Relaxed);
+                    #[cfg(feature = "led")]
+                    state.led_pin.toggle();
                 }
-                #[cfg(feature = "led")]
-                state.led_pin.toggle();
 
                 state.next_pin.clear_interrupt(gpio::Interrupt::EdgeLow);
+            }
+            if state.play_pin.interrupt_status(gpio::Interrupt::EdgeLow) {
+                if !debounce {
+                    match play_state {
+                        STATE_PAUSE => PLAY_STATE.store(STATE_ABOUT_TO_PLAY, Ordering::Relaxed),
+                        STATE_PLAYING => PLAY_STATE.store(STATE_ABOUT_TO_PAUSE, Ordering::Relaxed),
+                        _ => (),
+                    }
+                    #[cfg(feature = "led")]
+                    state.led_pin.toggle();
+                }
+
+                state.play_pin.clear_interrupt(gpio::Interrupt::EdgeLow);
             }
         }
     })
@@ -388,7 +411,7 @@ fn IO_IRQ_BANK0() {
 pub static PICOTOOL_ENTRIES: [hal::binary_info::EntryAddr; 5] = [
     hal::binary_info::rp_cargo_bin_name!(),
     hal::binary_info::rp_cargo_version!(),
-    hal::binary_info::rp_program_description!(c"Blinky Example"),
+    hal::binary_info::rp_program_description!(c"Pico Audio"),
     hal::binary_info::rp_cargo_homepage_url!(),
     hal::binary_info::rp_program_build_attribute!(),
 ];

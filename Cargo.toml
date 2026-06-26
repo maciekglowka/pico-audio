@@ -10,6 +10,7 @@ usb = ["dep:usb-device", "dep:usbd-serial"]
 [dependencies]
 critical-section = {version = "1.2.0"}
 embedded-hal = "1.0.0"
+embedded-hal-nb = "1.0.0"
 panic-halt = "0.2.0"
 rp235x-hal = { version = "0.4.0", features = ["critical-section-impl"] }
 
